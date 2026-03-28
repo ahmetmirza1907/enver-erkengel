@@ -9,7 +9,7 @@ from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTyp
 
 load_dotenv()
 
-groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
+groq = Groq(api_key=os.environ["GROQ_API_KEY"])
 sohbet_gecmisi = {}
 
 def obilet_ara(nereden, nereye):
