@@ -1,10 +1,7 @@
+import os
 import time
 import statistics
-import os
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
+import httpx
 from groq import Groq
 from dotenv import load_dotenv
 from telegram import Update
@@ -13,49 +10,93 @@ from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTyp
 load_dotenv()
 
 groq = Groq(api_key=os.getenv("GROQ_API_KEY"))
-
-# Her kullanıcının sohbet geçmişini tut
 sohbet_gecmisi = {}
 
 def obilet_ara(nereden, nereye):
-    url = f"https://www.obilet.com/otobus-bileti/{nereden}-{nereye}"
+    bugun = time.strftime("%Y-%m-%d")
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Origin": "https://www.obilet.com",
+        "Referer": "https://www.obilet.com/"
+    }
 
-    options = webdriver.ChromeOptions()
-    options.add_argument("--headless")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--window-size=1920,1080")
-    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36")
+    # Önce oturum al
+    session_url = "https://service.obilet.com/v2/Client/GetSession"
+    session_body = {
+        "DeviceSession": None,
+        "Application": 1,
+        "UserId": None,
+        "ShowGridOffers": True
+    }
 
-    driver = webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()),
-        options=options
-    )
-
-    driver.get(url)
-    time.sleep(5)
-
-    seferler_ham = []
-    seferler = driver.find_elements(By.CSS_SELECTOR, ".journeys ul li")
-
-    for sefer in seferler[:15]:
+    with httpx.Client(timeout=30) as client:
         try:
-            firma = sefer.find_element(By.CSS_SELECTOR, "[itemprop='name']").get_attribute("content")
-            kalkis = sefer.find_element(By.CSS_SELECTOR, "[itemprop='departureTime']").text.strip()
-            varis = sefer.find_element(By.CSS_SELECTOR, "[itemprop='arrivalTime']").text.strip()
-            fiyat_str = sefer.find_element(By.CSS_SELECTOR, "[itemprop='lowPrice']").text.strip()
-            fiyat_sayi = int(fiyat_str.replace("₺","").replace(".","").replace(",","").strip())
-            seferler_ham.append({
-                "firma": firma,
-                "kalkis": kalkis,
-                "varis": varis,
-                "fiyat_str": fiyat_str,
-                "fiyat": fiyat_sayi
-            })
+            session_res = client.post(session_url, json=session_body, headers=headers)
+            session_data = session_res.json()
+            session_id = session_data["Data"]["SessionId"]
         except:
-            continue
+            return []
 
-    driver.quit()
-    return seferler_ham
+        # Lokasyon ID bul
+        loc_url = "https://service.obilet.com/v2/Location/GetLocations"
+        
+        nereden_res = client.post(loc_url, json={
+            "DeviceSession": {"SessionId": session_id},
+            "Application": 1,
+            "Query": nereden
+        }, headers=headers)
+        
+        nereye_res = client.post(loc_url, json={
+            "DeviceSession": {"SessionId": session_id},
+            "Application": 1,
+            "Query": nereye
+        }, headers=headers)
+
+        try:
+            nereden_id = nereden_res.json()["Data"][0]["Id"]
+            nereye_id = nereye_res.json()["Data"][0]["Id"]
+        except:
+            return []
+
+        # Sefer ara
+        journey_url = "https://service.obilet.com/v2/Journey/GetBusJourneys"
+        journey_body = {
+            "DeviceSession": {"SessionId": session_id},
+            "Application": 1,
+            "DepartureId": nereden_id,
+            "ArrivalId": nereye_id,
+            "DepartureDate": bugun,
+            "PassengerCount": 1
+        }
+
+        journey_res = client.post(journey_url, json=journey_body, headers=headers)
+        
+        try:
+            seferler_raw = journey_res.json()["Data"]
+        except:
+            return []
+
+        seferler = []
+        for s in seferler_raw[:15]:
+            try:
+                firma = s.get("PartnerName", "?")
+                kalkis = s.get("DepartureTime", "?")[:5]
+                varis = s.get("ArrivalTime", "?")[:5]
+                fiyat = int(s.get("OriginalPrice", 0))
+                seferler.append({
+                    "firma": firma,
+                    "kalkis": kalkis,
+                    "varis": varis,
+                    "fiyat_str": f"{fiyat}₺",
+                    "fiyat": fiyat
+                })
+            except:
+                continue
+
+        return seferler
 
 def formatla(seferler, nereden, nereye):
     if not seferler:
@@ -104,7 +145,6 @@ async def mesaj_isle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kullanici_id = update.effective_user.id
     soru = update.message.text
 
-    # Kullanıcının sohbet geçmişini başlat
     if kullanici_id not in sohbet_gecmisi:
         sohbet_gecmisi[kullanici_id] = [
             {
@@ -112,21 +152,12 @@ async def mesaj_isle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "content": """Sen Türkiye'nin en iyi seyahat asistanısın. 
                 Kullanıcıya seyahat önerileri yaparsın, rotalar önerirsin, 
                 gezilecek yerleri anlatırsın ve otobüs bileti tavsiyesi verirsin.
-                Türkçe konuş, samimi ve yardımsever ol.
-                Kullanıcı bir tur veya gezi isterse önce güzel bir rota öner,
-                sonra hangi şehirden başlamaları gerektiğini söyle.
-                Eğer kullanıcı bilet sormadan önce rota öneriyorsan,
-                sohbetin sonunda 'İstanbul-Erzurum bileti aramak ister misin?' gibi bir öneri yap."""
+                Türkçe konuş, samimi ve yardımsever ol."""
             }
         ]
 
-    # Kullanıcı mesajını geçmişe ekle
-    sohbet_gecmisi[kullanici_id].append({
-        "role": "user",
-        "content": soru
-    })
+    sohbet_gecmisi[kullanici_id].append({"role": "user", "content": soru})
 
-    # Bilet araması var mı kontrol et
     nereden, nereye = bilet_ara_mi(soru)
 
     if nereden and nereye:
@@ -134,28 +165,18 @@ async def mesaj_isle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         seferler = obilet_ara(nereden, nereye)
         bilet_mesaji = formatla(seferler, nereden, nereye)
         await update.message.reply_text(bilet_mesaji, parse_mode="Markdown")
-
-        # Asistana da bildir
         sohbet_gecmisi[kullanici_id].append({
             "role": "assistant",
             "content": f"{nereden} → {nereye} seferlerini listeledim."
         })
     else:
-        # Normal sohbet — Groq'a gönder
         response = groq.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=sohbet_gecmisi[kullanici_id],
             max_tokens=800
         )
-
         asistan_cevabi = response.choices[0].message.content
-
-        # Cevabı geçmişe ekle
-        sohbet_gecmisi[kullanici_id].append({
-            "role": "assistant",
-            "content": asistan_cevabi
-        })
-
+        sohbet_gecmisi[kullanici_id].append({"role": "assistant", "content": asistan_cevabi})
         await update.message.reply_text(asistan_cevabi)
 
 app = ApplicationBuilder().token(os.getenv("TELEGRAM_TOKEN")).build()
